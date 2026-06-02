@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
+import http.cookiejar
 import ipaddress
 import json
 import os
 import random
 import re
+import shutil
 import sqlite3
+import ssl
 import subprocess
 import sys
 import uuid
 from getpass import getpass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib import error, parse, request
+from urllib.request import HTTPCookieProcessor, HTTPSHandler, build_opener
 
 
 DB_PATH = "/etc/x-ui/x-ui.db"
 STATE_PATH = "/etc/x-ui/cf_auto_state.json"
 LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_auto_last_links.txt")
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
+DEFAULT_PANEL_URL = "http://127.0.0.1:2053"
 PORT_MIN = 10000
 PORT_MAX = 60000
 PROTOCOL_ORDER = ["vless", "trojan", "vmess"]
@@ -24,6 +29,54 @@ PROTOCOL_SUFFIX = {"vless": "vl", "trojan": "tr", "vmess": "vm"}
 PROTOCOL_LABEL = {"vless": "VLESS", "trojan": "TROJAN", "vmess": "VMESS"}
 PROTOCOL_QUERY_FLAG = {"vless": "ev", "trojan": "et", "vmess": "evm"}
 MANAGED_RULE_PREFIX = "3x-ui-auto "
+PANEL_API_PREFIX = "panel/api"
+BACKEND_DB = "db"
+BACKEND_API = "api"
+API_MIN_VERSION = (2, 0, 0)
+XUI_BINARY_CANDIDATES = ("/usr/local/x-ui/x-ui", "/usr/bin/x-ui")
+XUI_CLI_SCRIPT_CANDIDATES = ("/usr/bin/x-ui", "/usr/local/x-ui/x-ui.sh")
+XUI_MENU_ZH_MARKER = "# cf-deployer-xui-menu-zh"
+XUI_MENU_REPLACEMENTS: List[tuple[str, str]] = [
+    ('echo "The OS release is: $release"', 'echo "系统发行版: $release"'),
+    ("3X-UI Panel Management Script", "3X-UI 面板管理脚本"),
+    ("0.${plain} Exit Script", "0.${plain} 退出脚本"),
+    ("1.${plain} Install", "1.${plain} 安装"),
+    ("2.${plain} Update", "2.${plain} 更新"),
+    ("3.${plain} Update Menu", "3.${plain} 更新菜单"),
+    ("4.${plain} Legacy Version", "4.${plain} 旧版安装"),
+    ("5.${plain} Uninstall", "5.${plain} 卸载"),
+    ("6.${plain} Reset Username & Password", "6.${plain} 重置用户名和密码"),
+    ("7.${plain} Reset Web Base Path", "7.${plain} 重置面板访问路径"),
+    ("8.${plain} Reset Settings", "8.${plain} 重置面板设置"),
+    ("9.${plain} Change Port", "9.${plain} 修改面板端口"),
+    ("10.${plain} View Current Settings", "10.${plain} 查看当前设置"),
+    ("11.${plain} Start", "11.${plain} 启动"),
+    ("12.${plain} Stop", "12.${plain} 停止"),
+    ("13.${plain} Restart", "13.${plain} 重启"),
+    ("14.${plain} Restart Xray", "14.${plain} 重启 Xray"),
+    ("15.${plain} Check Status", "15.${plain} 查看状态"),
+    ("16.${plain} Logs Management", "16.${plain} 日志管理"),
+    ("17.${plain} Enable Autostart", "17.${plain} 启用开机自启"),
+    ("18.${plain} Disable Autostart", "18.${plain} 禁用开机自启"),
+    ("19.${plain} SSL Certificate Management", "19.${plain} SSL 证书管理"),
+    ("20.${plain} Cloudflare SSL Certificate", "20.${plain} Cloudflare SSL 证书"),
+    ("21.${plain} IP Limit Management", "21.${plain} IP 限制管理"),
+    ("22.${plain} Firewall Management", "22.${plain} 防火墙管理"),
+    ("23.${plain} SSH Port Forwarding Management", "23.${plain} SSH 端口转发管理"),
+    ("24.${plain} Enable BBR", "24.${plain} 启用 BBR"),
+    ("25.${plain} Update Geo Files", "25.${plain} 更新 Geo 文件"),
+    ("26.${plain} Speedtest by Ookla", "26.${plain} Ookla 测速"),
+    ("27.${plain} PostgreSQL Management", "27.${plain} PostgreSQL 管理"),
+    ('read -rp "Please enter your selection [0-27]: " num', 'read -rp "请输入选项 [0-27]: " num'),
+    ('LOGE "Please enter the correct number [0-27]"', 'LOGE "请输入正确选项 [0-27]"'),
+    ('echo -e "Panel state: ${green}Running${plain}"', 'echo -e "面板状态: ${green}运行中${plain}"'),
+    ('echo -e "Panel state: ${yellow}Not Running${plain}"', 'echo -e "面板状态: ${yellow}未运行${plain}"'),
+    ('echo -e "Panel state: ${red}Not Installed${plain}"', 'echo -e "面板状态: ${red}未安装${plain}"'),
+    ('echo -e "Start automatically: ${green}Yes${plain}"', 'echo -e "开机自启: ${green}是${plain}"'),
+    ('echo -e "Start automatically: ${red}No${plain}"', 'echo -e "开机自启: ${red}否${plain}"'),
+    ('echo -e "xray state: ${green}Running${plain}"', 'echo -e "xray 状态: ${green}运行中${plain}"'),
+    ('echo -e "xray state: ${red}Not Running${plain}"', 'echo -e "xray 状态: ${red}未运行${plain}"'),
+]
 
 
 def exit_error(message: str) -> None:
@@ -38,6 +91,7 @@ def call_json_api(
     data: Optional[Dict[str, Any]] = None,
     timeout: int = 20,
     exit_on_http_error: bool = True,
+    opener: Optional[Any] = None,
 ):
     payload = None
     if data is not None:
@@ -45,8 +99,9 @@ def call_json_api(
 
     req = request.Request(url=url, data=payload, headers=headers or {}, method=method)
 
+    open_fn = opener.open if opener is not None else request.urlopen
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
+        with open_fn(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
     except error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
@@ -82,6 +137,477 @@ def call_cf_api(
         print(json.dumps(errors, ensure_ascii=False))
         sys.exit(1)
     return result.get("result")
+
+
+class XuiPanelClient:
+    """3x-ui 面板 REST API 客户端（支持 Session 登录或 Bearer Token）。"""
+
+    def __init__(self, base_url: str, token: Optional[str] = None, insecure_tls: bool = False):
+        self.base_url = base_url.rstrip("/")
+        self.token = (token or "").strip() or None
+        self.csrf_token: Optional[str] = None
+        self.insecure_tls = insecure_tls
+        jar = http.cookiejar.CookieJar()
+        handlers: List[Any] = [HTTPCookieProcessor(jar)]
+        if insecure_tls:
+            handlers.append(HTTPSHandler(context=ssl._create_unverified_context()))
+        self.opener = build_opener(*handlers)
+
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}/{path.lstrip('/')}"
+
+    def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if extra:
+            headers.update(extra)
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        elif self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        return headers
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+        *,
+        require_success: bool = True,
+        auth_required: bool = True,
+    ) -> Dict[str, Any]:
+        if auth_required and not self.token and not self.csrf_token:
+            exit_error("未登录 3x-ui 面板，请先调用 login() 或提供 API Token")
+
+        result = call_json_api(
+            method=method,
+            url=self._url(path),
+            headers=self._headers(),
+            data=data,
+            opener=self.opener,
+        )
+        if require_success and not result.get("success", False):
+            msg = result.get("msg") or result.get("message") or json.dumps(result, ensure_ascii=False)
+            exit_error(f"3x-ui API 失败: {msg}")
+        return result
+
+    def fetch_csrf_token(self) -> str:
+        result = self._request("GET", "csrf-token", require_success=True, auth_required=False)
+        token = result.get("obj")
+        if not isinstance(token, str) or not token:
+            exit_error("获取 CSRF Token 失败")
+        self.csrf_token = token
+        return token
+
+    def login(self, username: str, password: str, two_factor_code: str = "") -> None:
+        self.fetch_csrf_token()
+        payload: Dict[str, Any] = {"username": username, "password": password}
+        if two_factor_code.strip():
+            payload["twoFactorCode"] = two_factor_code.strip()
+        self._request("POST", "login", data=payload, auth_required=False)
+        if not self.csrf_token:
+            exit_error("3x-ui 登录失败：未获得 CSRF Token")
+
+    def list_inbounds(self) -> List[Dict[str, Any]]:
+        result = self._request("GET", f"{PANEL_API_PREFIX}/inbounds/list")
+        obj = result.get("obj")
+        if isinstance(obj, list):
+            return obj
+        return []
+
+    def add_inbound(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        result = self._request("POST", f"{PANEL_API_PREFIX}/inbounds/add", data=payload)
+        obj = result.get("obj")
+        if isinstance(obj, dict):
+            return obj
+        return {}
+
+    def delete_inbound(self, inbound_id: int) -> None:
+        self._request("POST", f"{PANEL_API_PREFIX}/inbounds/del/{inbound_id}")
+
+    def restart_xray(self) -> None:
+        self._request("POST", f"{PANEL_API_PREFIX}/server/restartXrayService")
+
+
+def parse_version(version_text: str) -> Tuple[int, ...]:
+    parts: List[int] = []
+    for token in re.split(r"[^0-9]+", version_text.strip()):
+        if token.isdigit():
+            parts.append(int(token))
+    return tuple(parts) if parts else (0,)
+
+
+def version_at_least(version_tuple: Tuple[int, ...], minimum: Tuple[int, ...]) -> bool:
+    width = max(len(version_tuple), len(minimum))
+    left = version_tuple + (0,) * (width - len(version_tuple))
+    right = minimum + (0,) * (width - len(minimum))
+    return left >= right
+
+
+def find_xui_binary() -> Optional[str]:
+    candidates: List[str] = []
+    which = shutil.which("x-ui")
+    if which:
+        candidates.append(which)
+    candidates.extend(XUI_BINARY_CANDIDATES)
+
+    seen: Set[str] = set()
+    for path in candidates:
+        if not path or path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        try:
+            result = subprocess.run(
+                [path, "-v"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        version = (result.stdout or result.stderr or "").strip().splitlines()
+        if version and re.match(r"^\d", version[0]):
+            return path
+    return None
+
+
+def read_xui_version(binary: Optional[str]) -> Optional[str]:
+    if not binary:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "-v"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = (result.stdout or result.stderr or "").strip().splitlines()
+    if not text:
+        return None
+    return text[0]
+
+
+def read_setting_from_db(key: str) -> Optional[str]:
+    if not os.path.isfile(DB_PATH):
+        return None
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+            row = cur.fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def detect_panel_url() -> Tuple[str, bool]:
+    env_url = os.environ.get("XUI_PANEL_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/"), env_url.lower().startswith("https://")
+
+    port = read_setting_from_db("webPort") or "2053"
+    base_path = read_setting_from_db("webBasePath") or "/"
+    cert = (read_setting_from_db("webCertFile") or "").strip()
+    key = (read_setting_from_db("webKeyFile") or "").strip()
+    https = bool(cert and key)
+    if not base_path.startswith("/"):
+        base_path = f"/{base_path}"
+    base_path = base_path.rstrip("/") or ""
+    return f"{'https' if https else 'http'}://127.0.0.1:{port}{base_path}", https
+
+
+def read_api_token_from_cli(binary: Optional[str]) -> Optional[str]:
+    if not binary:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "setting", "-getApiToken"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    for line in output.splitlines():
+        if line.startswith("apiToken:"):
+            token = line.split(":", 1)[1].strip()
+            return token or None
+    return None
+
+
+def panel_tls_insecure(panel_url: str, panel_https: bool) -> bool:
+    if not panel_https:
+        return False
+    if os.environ.get("XUI_TLS_INSECURE", "").strip().lower() in ("1", "true", "yes", "y"):
+        return True
+    host = parse.urlparse(panel_url).hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def probe_panel_api(panel_url: str, api_token: Optional[str], insecure_tls: bool) -> bool:
+    client = XuiPanelClient(panel_url, token=api_token, insecure_tls=insecure_tls)
+    csrf = call_json_api(
+        "GET",
+        client._url("csrf-token"),
+        headers=client._headers(),
+        opener=client.opener,
+        exit_on_http_error=False,
+        timeout=8,
+    )
+    if csrf.get("success") and isinstance(csrf.get("obj"), str):
+        return True
+    if api_token:
+        listed = call_json_api(
+            "GET",
+            client._url(f"{PANEL_API_PREFIX}/inbounds/list"),
+            headers=client._headers(),
+            opener=client.opener,
+            exit_on_http_error=False,
+            timeout=8,
+        )
+        return bool(listed.get("success"))
+    return False
+
+
+def api_auth_available(env: Dict[str, Any]) -> bool:
+    return bool((env.get("api_token") or "").strip())
+
+
+def find_xui_cli_script() -> Optional[str]:
+    candidates: List[str] = []
+    which = shutil.which("x-ui")
+    if which:
+        candidates.append(which)
+    candidates.extend(XUI_CLI_SCRIPT_CANDIDATES)
+
+    seen: Set[str] = set()
+    for path in candidates:
+        if not path or path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                head = handle.read(4096)
+        except OSError:
+            continue
+        if "show_menu()" in head or "Panel Management Script" in head:
+            return path
+    return None
+
+
+def is_xui_menu_localized(script_path: str) -> bool:
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="ignore") as handle:
+            return XUI_MENU_ZH_MARKER in handle.read(8192)
+    except OSError:
+        return False
+
+
+def apply_xui_menu_localization() -> None:
+    script_path = find_xui_cli_script()
+    if not script_path:
+        print("未找到 x-ui 命令脚本，跳过汉化")
+        return
+    if is_xui_menu_localized(script_path):
+        print("x-ui 命令菜单已是中文，跳过")
+        return
+
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="ignore") as handle:
+            content = handle.read()
+    except OSError as e:
+        exit_error(f"读取 x-ui 脚本失败: {e}")
+
+    backup_path = f"{script_path}.en.bak"
+    if not os.path.exists(backup_path):
+        try:
+            shutil.copy2(script_path, backup_path)
+        except OSError as e:
+            exit_error(f"备份 x-ui 脚本失败: {e}")
+
+    updated = content
+    applied = 0
+    for old, new in XUI_MENU_REPLACEMENTS:
+        if old not in updated:
+            continue
+        updated = updated.replace(old, new)
+        applied += 1
+
+    if applied == 0:
+        exit_error("x-ui 汉化失败：未匹配到菜单文本，可能脚本版本不兼容")
+
+    if updated.startswith("#!"):
+        lines = updated.splitlines(keepends=True)
+        if not any(XUI_MENU_ZH_MARKER in line for line in lines[:5]):
+            lines.insert(1, f"{XUI_MENU_ZH_MARKER}\n")
+        updated = "".join(lines)
+    else:
+        updated = f"{XUI_MENU_ZH_MARKER}\n{updated}"
+
+    try:
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(updated)
+    except OSError as e:
+        exit_error(f"写入 x-ui 汉化脚本失败: {e}")
+
+    print(f"x-ui 命令菜单已汉化: {script_path}")
+    print(f"英文备份: {backup_path}")
+
+
+def prompt_maybe_localize_xui_menu() -> None:
+    env_flag = os.environ.get("XUI_LOCALIZE_MENU", "").strip().lower()
+    if env_flag in ("0", "no", "n", "false"):
+        return
+    if env_flag in ("1", "yes", "y", "true"):
+        apply_xui_menu_localization()
+        return
+
+    script_path = find_xui_cli_script()
+    if not script_path or is_xui_menu_localized(script_path):
+        return
+
+    answer = input("是否汉化 x-ui 命令菜单? (y/N): ").strip().lower()
+    if answer in ("y", "yes"):
+        apply_xui_menu_localization()
+
+
+def detect_xui_environment() -> Dict[str, Any]:
+    binary = find_xui_binary()
+    version = read_xui_version(binary)
+    version_tuple = parse_version(version) if version else (0,)
+    db_available = os.path.isfile(DB_PATH)
+    panel_url, panel_https = detect_panel_url()
+    insecure_tls = panel_tls_insecure(panel_url, panel_https)
+    api_token = os.environ.get("XUI_API_TOKEN", "").strip() or read_api_token_from_cli(binary)
+
+    api_capable = version_tuple == (0,) or version_at_least(version_tuple, API_MIN_VERSION)
+    api_reachable = False
+    if api_capable:
+        api_reachable = probe_panel_api(panel_url, api_token, insecure_tls)
+
+    return {
+        "binary": binary,
+        "version": version,
+        "version_tuple": version_tuple,
+        "db_available": db_available,
+        "panel_url": panel_url,
+        "panel_https": panel_https,
+        "insecure_tls": insecure_tls,
+        "api_token": api_token,
+        "api_capable": api_capable,
+        "api_reachable": api_reachable,
+    }
+
+
+def backend_label(backend: str) -> str:
+    return "API" if backend == BACKEND_API else "数据库直写"
+
+
+def auto_select_backend(
+    env: Dict[str, Any],
+    state: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    explicit = os.environ.get("XUI_BACKEND", "").strip().lower()
+    if explicit == BACKEND_DB:
+        return BACKEND_DB, "环境变量 XUI_BACKEND=db"
+    if explicit == BACKEND_API:
+        if not api_auth_available(env):
+            exit_error("已强制 API 模式，但未检测到 API Token")
+        return BACKEND_API, "环境变量 XUI_BACKEND=api"
+
+    from_state = backend_from_state(state)
+    if from_state:
+        return from_state, "状态文件记录"
+
+    if api_auth_available(env):
+        return BACKEND_API, "检测到 API Token，使用 API"
+
+    if env.get("db_available"):
+        return BACKEND_DB, "未检测到 API Token，使用数据库直写"
+
+    exit_error("未检测到 API Token，且不存在本地数据库")
+
+
+def resolve_backend(
+    state: Optional[Dict[str, Any]] = None,
+    env: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any], str]:
+    runtime = env or detect_xui_environment()
+    backend, reason = auto_select_backend(runtime, state)
+    return backend, runtime, reason
+
+
+def setup_panel_client(env: Dict[str, Any], *, interactive: bool = True) -> XuiPanelClient:
+    panel_url = os.environ.get("XUI_PANEL_URL", "").strip() or str(env["panel_url"])
+    insecure = bool(env.get("insecure_tls"))
+    token = os.environ.get("XUI_API_TOKEN", "").strip() or str(env.get("api_token") or "").strip()
+    if not token:
+        exit_error("API 模式需要 API Token（可通过 x-ui setting -getApiToken 获取）")
+    return XuiPanelClient(panel_url, token=token, insecure_tls=insecure)
+
+
+def backend_from_state(state: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not state:
+        return None
+    backend = str(state.get("backend", "")).strip().lower()
+    if backend in (BACKEND_DB, BACKEND_API):
+        return backend
+    version = state.get("version")
+    if version == 2:
+        return BACKEND_API
+    if version == 1:
+        return BACKEND_DB
+    return None
+
+
+def prompt_panel_client() -> XuiPanelClient:
+    panel_url = (
+        os.environ.get("XUI_PANEL_URL", "").strip()
+        or input(f"3x-ui 面板地址(回车={DEFAULT_PANEL_URL}): ").strip()
+        or DEFAULT_PANEL_URL
+    )
+    insecure = panel_url.lower().startswith("https://")
+    if insecure:
+        answer = input("面板为 HTTPS 且可能自签名，跳过证书校验? (Y/n): ").strip().lower()
+        insecure = answer in ("", "y", "yes")
+
+    token = os.environ.get("XUI_API_TOKEN", "").strip()
+    if not token:
+        auth_mode = input("3x-ui 认证(1=用户名密码,2=API Token，回车=1): ").strip() or "1"
+        if auth_mode in ("2", "token", "t"):
+            token = getpass("3x-ui API Token: ").strip()
+            if not token:
+                exit_error("API Token 不能为空")
+            return XuiPanelClient(panel_url, token=token, insecure_tls=insecure)
+
+    username = os.environ.get("XUI_USERNAME", "").strip()
+    password = os.environ.get("XUI_PASSWORD", "").strip()
+    if not username:
+        username = input("3x-ui 用户名: ").strip()
+    if not password:
+        password = getpass("3x-ui 密码: ").strip()
+    if not username or not password:
+        exit_error("3x-ui 用户名和密码不能为空")
+
+    client = XuiPanelClient(panel_url, insecure_tls=insecure)
+    two_factor = os.environ.get("XUI_2FA", "").strip()
+    if not two_factor and not sys.stdin.isatty():
+        two_factor = ""
+    elif not two_factor:
+        two_factor = input("3x-ui 两步验证码(无则回车): ").strip()
+    client.login(username, password, two_factor_code=two_factor)
+    return client
 
 
 def get_public_ipv4() -> str:
@@ -157,9 +683,8 @@ def upsert_dns_record(zone_id: str, domain: str, ip: str, headers: Dict[str, str
         record_id = str(existing["id"])
         call_cf_api("PUT", f"/zones/{zone_id}/dns_records/{record_id}", headers=headers, data=payload)
         return record_id
-    else:
-        created = call_cf_api("POST", f"/zones/{zone_id}/dns_records", headers=headers, data=payload)
-        return str(created["id"])
+    created = call_cf_api("POST", f"/zones/{zone_id}/dns_records", headers=headers, data=payload)
+    return str(created["id"])
 
 
 def get_ssl_mode(zone_id: str, headers: Dict[str, str]) -> str:
@@ -225,7 +750,6 @@ def get_origin_rules(zone_id: str, headers: Dict[str, str]) -> List[Dict[str, An
 
 
 def put_origin_rules(zone_id: str, headers: Dict[str, str], rules: List[Dict[str, Any]]) -> None:
-    # Cloudflare phases entrypoint 接口使用最小 body，避免字段不兼容
     payload = {"rules": rules}
     call_cf_api(
         "PUT",
@@ -331,7 +855,22 @@ def allocate_settings() -> Dict[str, Any]:
     return {"strategy": "always", "refresh": 5, "concurrency": 3}
 
 
-def load_existing_ports(conn: sqlite3.Connection) -> Set[int]:
+def build_inbound_payload(protocol: str, user_uuid: str, short_id: str, route: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "enable": True,
+        "remark": f"{short_id}-{protocol}",
+        "listen": "",
+        "port": route["port"],
+        "protocol": protocol,
+        "expiryTime": 0,
+        "tag": f"{short_id}-{protocol}",
+        "settings": json.dumps(protocol_settings(protocol, user_uuid), separators=(",", ":")),
+        "streamSettings": json.dumps(ws_stream_settings(route["path"]), separators=(",", ":")),
+        "sniffing": json.dumps(sniffing_settings(), separators=(",", ":")),
+    }
+
+
+def load_existing_ports_db(conn: sqlite3.Connection) -> Set[int]:
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT port FROM inbounds")
@@ -342,6 +881,16 @@ def load_existing_ports(conn: sqlite3.Connection) -> Set[int]:
         try:
             ports.add(int(row[0]))
         except Exception:
+            continue
+    return ports
+
+
+def load_existing_ports_api(client: XuiPanelClient) -> Set[int]:
+    ports: Set[int] = set()
+    for inbound in client.list_inbounds():
+        try:
+            ports.add(int(inbound.get("port", 0)))
+        except (TypeError, ValueError):
             continue
     return ports
 
@@ -428,7 +977,7 @@ def infer_default_value(col_type: str):
     return ""
 
 
-def insert_inbounds(
+def insert_inbounds_db(
     db_path: str,
     user_uuid: str,
     short_id: str,
@@ -497,7 +1046,7 @@ def insert_inbounds(
         conn.close()
 
 
-def delete_inbounds(db_path: str, inbound_ids: List[int], tags: List[str]) -> None:
+def delete_inbounds_db(db_path: str, inbound_ids: List[int], tags: List[str]) -> None:
     try:
         conn = sqlite3.connect(db_path)
     except sqlite3.Error as e:
@@ -519,7 +1068,7 @@ def delete_inbounds(db_path: str, inbound_ids: List[int], tags: List[str]) -> No
         conn.close()
 
 
-def restart_xui() -> None:
+def restart_xui_service() -> None:
     try:
         result = subprocess.run(
             ["systemctl", "restart", "x-ui"],
@@ -539,6 +1088,63 @@ def restart_xui() -> None:
         else:
             print(str(e))
         sys.exit(1)
+
+
+def create_inbounds_via_api(
+    client: XuiPanelClient,
+    user_uuid: str,
+    short_id: str,
+    routes: List[Dict[str, Any]],
+) -> List[int]:
+    inserted_ids: List[int] = []
+    for route in routes:
+        protocol = route["protocol"]
+        payload = build_inbound_payload(protocol, user_uuid, short_id, route)
+        created = client.add_inbound(payload)
+        inbound_id = created.get("id")
+        if inbound_id is None:
+            exit_error(f"创建 {protocol} 入站失败：API 未返回 id")
+        inserted_ids.append(int(inbound_id))
+    client.restart_xray()
+    return inserted_ids
+
+
+def delete_inbounds_via_api(client: XuiPanelClient, inbound_ids: List[int]) -> None:
+    for inbound_id in inbound_ids:
+        client.delete_inbound(inbound_id)
+    if inbound_ids:
+        client.restart_xray()
+
+
+def create_inbounds(
+    backend: str,
+    user_uuid: str,
+    short_id: str,
+    routes: List[Dict[str, Any]],
+    panel: Optional[XuiPanelClient] = None,
+) -> List[int]:
+    if backend == BACKEND_API:
+        if panel is None:
+            exit_error("API 模式需要已登录的面板客户端")
+        return create_inbounds_via_api(panel, user_uuid, short_id, routes)
+    inbound_ids = insert_inbounds_db(DB_PATH, user_uuid, short_id, routes)
+    restart_xui_service()
+    return inbound_ids
+
+
+def delete_managed_inbounds(
+    backend: str,
+    inbound_ids: List[int],
+    tags: List[str],
+    panel: Optional[XuiPanelClient] = None,
+) -> None:
+    if backend == BACKEND_API:
+        if panel is None:
+            exit_error("API 模式需要已登录的面板客户端")
+        delete_inbounds_via_api(panel, inbound_ids)
+        return
+    delete_inbounds_db(DB_PATH, inbound_ids, tags)
+    restart_xui_service()
 
 
 def build_links(user_uuid: str, domain: str, routes: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -637,10 +1243,13 @@ def extract_uuid_from_settings(protocol: str, settings_text: str) -> str:
 
 
 def extract_ws_path(stream_settings_text: str) -> str:
-    try:
-        payload = json.loads(stream_settings_text or "{}")
-    except json.JSONDecodeError:
-        return ""
+    if isinstance(stream_settings_text, dict):
+        payload = stream_settings_text
+    else:
+        try:
+            payload = json.loads(stream_settings_text or "{}")
+        except json.JSONDecodeError:
+            return ""
     ws = payload.get("wsSettings")
     if not isinstance(ws, dict):
         return ""
@@ -662,47 +1271,7 @@ def extract_short_id(path: str, tag: str, remark: str) -> str:
     return ""
 
 
-def load_legacy_routes_from_xui() -> Dict[str, Any]:
-    try:
-        conn = sqlite3.connect(DB_PATH)
-    except sqlite3.Error as e:
-        exit_error(str(e))
-
-    rows: List[Dict[str, Any]] = []
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, protocol, settings, stream_settings, tag, remark, enable "
-            "FROM inbounds WHERE protocol IN ('vless','trojan','vmess') ORDER BY id DESC"
-        )
-        for item in cursor.fetchall():
-            protocol = str(item[1]).strip().lower()
-            if protocol not in PROTOCOL_ORDER:
-                continue
-            ws_path = extract_ws_path(str(item[3] or ""))
-            if not ws_path:
-                continue
-            short_id = extract_short_id(ws_path, str(item[4] or ""), str(item[5] or ""))
-            if not short_id:
-                continue
-            user_uuid = extract_uuid_from_settings(protocol, str(item[2] or ""))
-            if not user_uuid:
-                continue
-            rows.append(
-                {
-                    "id": int(item[0]),
-                    "protocol": protocol,
-                    "path": ws_path,
-                    "short_id": short_id,
-                    "uuid": user_uuid,
-                    "enable": int(item[6] or 0),
-                }
-            )
-    except sqlite3.Error as e:
-        exit_error(str(e))
-    finally:
-        conn.close()
-
+def _group_legacy_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {}
 
@@ -743,6 +1312,91 @@ def load_legacy_routes_from_xui() -> Dict[str, Any]:
     }
 
 
+def load_legacy_routes_from_db() -> Dict[str, Any]:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+    except sqlite3.Error as e:
+        exit_error(str(e))
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, protocol, settings, stream_settings, tag, remark, enable "
+            "FROM inbounds WHERE protocol IN ('vless','trojan','vmess') ORDER BY id DESC"
+        )
+        for item in cursor.fetchall():
+            protocol = str(item[1]).strip().lower()
+            if protocol not in PROTOCOL_ORDER:
+                continue
+            ws_path = extract_ws_path(str(item[3] or ""))
+            if not ws_path:
+                continue
+            short_id = extract_short_id(ws_path, str(item[4] or ""), str(item[5] or ""))
+            if not short_id:
+                continue
+            user_uuid = extract_uuid_from_settings(protocol, str(item[2] or ""))
+            if not user_uuid:
+                continue
+            rows.append(
+                {
+                    "id": int(item[0]),
+                    "protocol": protocol,
+                    "path": ws_path,
+                    "short_id": short_id,
+                    "uuid": user_uuid,
+                    "enable": int(item[6] or 0),
+                }
+            )
+    except sqlite3.Error as e:
+        exit_error(str(e))
+    finally:
+        conn.close()
+
+    return _group_legacy_rows(rows)
+
+
+def load_legacy_routes_from_panel(client: XuiPanelClient) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    for item in client.list_inbounds():
+        protocol = str(item.get("protocol", "")).strip().lower()
+        if protocol not in PROTOCOL_ORDER:
+            continue
+        stream_settings = item.get("streamSettings")
+        if isinstance(stream_settings, dict):
+            stream_text = json.dumps(stream_settings)
+        else:
+            stream_text = str(stream_settings or "")
+        ws_path = extract_ws_path(stream_text)
+        if not ws_path:
+            continue
+        short_id = extract_short_id(ws_path, str(item.get("tag") or ""), str(item.get("remark") or ""))
+        if not short_id:
+            continue
+        settings = item.get("settings")
+        if isinstance(settings, dict):
+            settings_text = json.dumps(settings)
+        else:
+            settings_text = str(settings or "")
+        user_uuid = extract_uuid_from_settings(protocol, settings_text)
+        if not user_uuid:
+            continue
+        inbound_id = item.get("id")
+        if inbound_id is None:
+            continue
+        rows.append(
+            {
+                "id": int(inbound_id),
+                "protocol": protocol,
+                "path": ws_path,
+                "short_id": short_id,
+                "uuid": user_uuid,
+                "enable": 1 if item.get("enable") else 0,
+            }
+        )
+    return _group_legacy_rows(rows)
+
+
 def print_last_links() -> None:
     if os.path.exists(LAST_LINKS_PATH):
         try:
@@ -765,7 +1419,6 @@ def print_last_links() -> None:
                     print(f"{PROTOCOL_LABEL.get(p, p.upper())}订阅 {links[p]}")
             return
 
-        # 兼容旧版本：state 里没有 links 时，使用 domain/uuid/routes 重新拼接
         legacy_domain = str(state.get("domain", "")).strip()
         legacy_uuid = str(state.get("uuid", "")).strip()
         legacy_routes = state.get("routes")
@@ -778,19 +1431,37 @@ def print_last_links() -> None:
                 print(f"{PROTOCOL_LABEL.get(protocol, protocol.upper())}订阅 {links[protocol]}")
             return
 
-    # 兼容更旧版本：无 state 信息，直接从 x-ui 数据库反推一套最新节点
-    recovered = load_legacy_routes_from_xui()
-    if not recovered:
-        exit_error("未找到可查看的上次订阅")
-    domain = input("未找到缓存，请输入绑定域名用于旧版兼容拼接: ").strip()
-    if not domain:
-        exit_error("域名不能为空")
-    links = build_links(str(recovered["uuid"]), domain, recovered["routes"])
-    order = recovered["selected_protocols"]
-    save_last_links_snapshot(domain, str(recovered["uuid"]), links, order)
-    for protocol in order:
-        if protocol in links:
-            print(f"{PROTOCOL_LABEL[protocol]}订阅 {links[protocol]}")
+    if os.path.exists(DB_PATH):
+        recovered = load_legacy_routes_from_db()
+        if recovered:
+            domain = input("未找到缓存，请输入绑定域名用于旧版兼容拼接: ").strip()
+            if not domain:
+                exit_error("域名不能为空")
+            links = build_links(str(recovered["uuid"]), domain, recovered["routes"])
+            order = recovered["selected_protocols"]
+            save_last_links_snapshot(domain, str(recovered["uuid"]), links, order)
+            for protocol in order:
+                if protocol in links:
+                    print(f"{PROTOCOL_LABEL[protocol]}订阅 {links[protocol]}")
+            return
+
+    if os.environ.get("XUI_API_TOKEN") or os.environ.get("XUI_PANEL_URL"):
+        runtime = detect_xui_environment()
+        panel = setup_panel_client(runtime, interactive=True)
+        recovered = load_legacy_routes_from_panel(panel)
+        if recovered:
+            domain = input("未找到缓存，请输入绑定域名用于旧版兼容拼接: ").strip()
+            if not domain:
+                exit_error("域名不能为空")
+            links = build_links(str(recovered["uuid"]), domain, recovered["routes"])
+            order = recovered["selected_protocols"]
+            save_last_links_snapshot(domain, str(recovered["uuid"]), links, order)
+            for protocol in order:
+                if protocol in links:
+                    print(f"{PROTOCOL_LABEL[protocol]}订阅 {links[protocol]}")
+            return
+
+    exit_error("未找到可查看的上次订阅")
 
 
 def restore_dns_record(
@@ -831,7 +1502,12 @@ def restore_dns_record(
         call_cf_api("DELETE", f"/zones/{zone_id}/dns_records/{record_id}", headers=headers)
 
 
-def uninstall_last_config(state: Dict[str, Any], headers: Dict[str, str]) -> None:
+def uninstall_last_config(
+    state: Dict[str, Any],
+    headers: Dict[str, str],
+    backend: str,
+    panel: Optional[XuiPanelClient] = None,
+) -> None:
     domain = str(state.get("domain", "")).strip()
     zone_id = str(state.get("zone_id", "")).strip()
     if not domain or not zone_id:
@@ -863,13 +1539,12 @@ def uninstall_last_config(state: Dict[str, Any], headers: Dict[str, str]) -> Non
         except Exception:
             continue
     tags = [str(x) for x in state.get("tags", []) if str(x).strip()]
-    delete_inbounds(DB_PATH, inbound_ids, tags)
-    restart_xui()
+    delete_managed_inbounds(backend, inbound_ids, tags, panel=panel)
 
 
 def main() -> None:
-    normalize_existing_inbound_client_email(DB_PATH)
     mode = parse_mode(input("模式(1=安装,2=卸载,3=查看上次订阅，回车=安装): "))
+    prompt_maybe_localize_xui_menu()
     last_state = load_last_state()
 
     if mode == "show":
@@ -879,6 +1554,11 @@ def main() -> None:
     if mode == "uninstall":
         if last_state is None:
             exit_error("未检测到上次配置，无法卸载")
+        backend, runtime, reason = resolve_backend(last_state)
+        print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
+        panel: Optional[XuiPanelClient] = None
+        if backend == BACKEND_API:
+            panel = setup_panel_client(runtime, interactive=False)
         cf_email = input("Cloudflare 邮箱: ").strip()
         cf_key = getpass("Cloudflare Global API Key: ").strip()
         if not cf_email or not cf_key:
@@ -888,10 +1568,20 @@ def main() -> None:
             "X-Auth-Key": cf_key,
             "Content-Type": "application/json",
         }
-        uninstall_last_config(last_state, headers)
+        uninstall_last_config(last_state, headers, backend, panel=panel)
         remove_last_state()
         print("卸载成功")
         return
+
+    backend, runtime, reason = resolve_backend()
+    print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
+    panel = None
+    if backend == BACKEND_DB:
+        if not os.path.exists(DB_PATH):
+            exit_error(f"未找到 3x-ui 数据库: {DB_PATH}")
+        normalize_existing_inbound_client_email(DB_PATH)
+    else:
+        panel = setup_panel_client(runtime, interactive=False)
 
     if last_state is not None:
         last_domain = str(last_state.get("domain", "未知域名"))
@@ -910,11 +1600,14 @@ def main() -> None:
     user_uuid = str(uuid.uuid4())
     short_id = user_uuid[:8]
 
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            existing_ports = load_existing_ports(conn)
-    except sqlite3.Error as e:
-        exit_error(str(e))
+    if backend == BACKEND_API:
+        existing_ports = load_existing_ports_api(panel)  # type: ignore[arg-type]
+    else:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                existing_ports = load_existing_ports_db(conn)
+        except sqlite3.Error as e:
+            exit_error(str(e))
 
     ports = random_ports(len(selected_protocols), existing_ports)
     routes = []
@@ -944,8 +1637,13 @@ def main() -> None:
     ssl_before = get_ssl_mode(zone_id, headers)
     origin_rules_before = get_origin_rules(zone_id, headers)
 
-    inbound_ids = insert_inbounds(DB_PATH, user_uuid=user_uuid, short_id=short_id, routes=routes)
-    restart_xui()
+    inbound_ids = create_inbounds(
+        backend,
+        user_uuid=user_uuid,
+        short_id=short_id,
+        routes=routes,
+        panel=panel,
+    )
 
     managed_dns_record_id = upsert_dns_record(zone_id, domain, public_ip, headers)
     set_ssl_mode(zone_id, headers, "flexible")
@@ -954,9 +1652,11 @@ def main() -> None:
     links = build_links(user_uuid, domain, routes)
     save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=selected_protocols)
 
+    state_version = 2 if backend == BACKEND_API else 1
     save_last_state(
         {
-            "version": 1,
+            "version": state_version,
+            "backend": backend,
             "domain": domain,
             "zone_id": zone_id,
             "uuid": user_uuid,

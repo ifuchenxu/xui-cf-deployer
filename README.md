@@ -3,7 +3,7 @@
 `xui_cf_deployer.py` 是一个基于 Python 3 标准库实现的本地脚本，用于在已安装 3x-ui 的 VPS 上自动完成：
 
 - 按需创建 VLESS / Trojan / VMess 节点
-- 写入 3x-ui SQLite 数据库并重启 `x-ui`
+- 通过 **3x-ui REST API** 或 **SQLite 直写**（旧版默认）创建/删除入站
 - 配置 Cloudflare DNS、SSL、Origin Rules
 - 生成 `yx-auto.pages.dev` 订阅链接
 - 检测上次配置并支持一键卸载回滚
@@ -11,8 +11,8 @@
 ## 前置条件（必须）
 
 - 目标 VPS **必须已安装并可正常运行 3x-ui 面板**
-- 系统中必须存在数据库文件：`/etc/x-ui/x-ui.db`
-- 系统服务 `x-ui` 必须可被 `systemctl restart x-ui` 正常重启
+- **旧版默认**：本地存在 `/etc/x-ui/x-ui.db`，脚本直写数据库并 `systemctl restart x-ui`
+- **新版可选**：面板 API 可访问，使用用户名密码或 API Token
 
 > 未满足以上条件时，请先完成 3x-ui 安装与可用性验证，再运行本脚本。
 
@@ -20,15 +20,31 @@
 
 - Python 3（无需安装第三方依赖）
 - 已安装并可用的 `3x-ui`（服务名通常为 `x-ui`）
-- 脚本运行用户具备 root 权限（或可用 `sudo`）
+- 脚本运行用户具备 root 权限（或可用 `sudo`，用于写入状态文件）
 - Cloudflare 账号邮箱 + Global API Key
+- 3x-ui 面板登录凭据或 API Token
 
 ## 文件说明
 
 - 脚本：`xui_cf_deployer.py`
-- 3x-ui 数据库：`/etc/x-ui/x-ui.db`
 - 状态记录：`/etc/x-ui/cf_auto_state.json`
 - 订阅快照：`cf_auto_last_links.txt`（保存在脚本运行目录）
+
+## x-ui 写入方式（自动检测）
+
+| 条件 | 写入方式 |
+|------|----------|
+| 检测到 **API Token**（`x-ui setting -getApiToken` 或 `XUI_API_TOKEN`） | **API** |
+| 无 Token 且存在 `/etc/x-ui/x-ui.db` | **数据库直写** |
+
+强制指定：`XUI_BACKEND=db` 或 `XUI_BACKEND=api`
+
+### x-ui 命令菜单汉化（可选）
+
+启动后会询问：`是否汉化 x-ui 命令菜单? (y/N)`（仅汉化 `x-ui` 命令行菜单，不影响 Web 面板）
+
+- 自动备份英文脚本为 `x-ui.en.bak`
+- `XUI_LOCALIZE_MENU=1` 自动汉化，`0` 跳过
 
 ## 运行命令
 
@@ -65,11 +81,7 @@ sudo ./xui_cf_deployer.py
 3. Cloudflare Global API Key（隐藏输入）
 4. 创建协议（`1=vless,2=trojan,3=vmess`，逗号分隔，回车=全部）
 
-脚本会自动：
-
-- 生成 UUID、短路径、随机高位端口
-- 向 `inbounds` 注入所选协议节点
-- 重启 `x-ui`
+脚本会自动检测 x-ui 版本与环境，选择 **数据库直写** 或 **API** 写入方式（无需手动选择）。
 - 配置 CF DNS（A 记录 + 代理）
 - 设置 CF SSL 为 `flexible`
 - 下发/合并 Origin Rules（路径转发到对应端口）
@@ -93,7 +105,7 @@ sudo ./xui_cf_deployer.py
 - 优先读取运行目录下的 `cf_auto_last_links.txt`
 - 若快照不存在，自动尝试旧版兼容重建：
   - 先用旧状态文件中的 `domain/uuid/routes` 重新拼接
-  - 再兜底从 `x-ui` 现有 `inbounds` 反推一套节点并拼接
+  - 再兜底通过 3x-ui API 列出现有入站并反推一套节点
 
 ## 订阅链接参数
 
@@ -114,6 +126,7 @@ sudo ./xui_cf_deployer.py
 ## 常见问题
 
 - 提示 Zone 匹配失败：检查输入的绑定域名是否在该 Cloudflare 账号下
-- 提示数据库写入失败：确认系统已安装 3x-ui 且数据库路径正确
+- 提示 3x-ui API 失败：检查面板地址、WebBasePath、用户名密码或 API Token
+- 提示 HTTPS 证书错误：选择跳过证书校验，或改用 `http://127.0.0.1:端口`
 - 提示权限不足：使用 `sudo` 运行脚本
 - 已存在上次配置无法安装：先用卸载模式清理后再重新安装
