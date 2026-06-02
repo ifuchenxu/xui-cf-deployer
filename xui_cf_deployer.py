@@ -20,7 +20,13 @@ from urllib.request import HTTPCookieProcessor, HTTPSHandler, build_opener
 
 DB_PATH = "/etc/x-ui/x-ui.db"
 STATE_PATH = "/etc/x-ui/cf_auto_state.json"
+PANEL_INFO_PATH = "/etc/x-ui/cf_panel_access.json"
 LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_auto_last_links.txt")
+PANEL_INFO_SNAPSHOT = os.path.join(os.getcwd(), "cf_panel_last_access.txt")
+CFD_BIN = "/usr/local/bin/cfd"
+DEPLOYER_INSTALL_PATH = "/usr/local/lib/cf-deployer/xui_cf_deployer.py"
+XUI_INSTALL_URL = "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+XUI_INSTALL_STDIN = "\nn\n4\n\n"
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 DEFAULT_PANEL_URL = "http://127.0.0.1:2053"
 PORT_MIN = 10000
@@ -346,6 +352,303 @@ def read_api_token_from_cli(binary: Optional[str]) -> Optional[str]:
             token = line.split(":", 1)[1].strip()
             return token or None
     return None
+
+
+def is_xui_installed() -> bool:
+    return os.path.isfile(DB_PATH) and find_xui_binary() is not None
+
+
+def parse_credentials_from_install_output(output: str) -> Tuple[Optional[str], Optional[str]]:
+    username: Optional[str] = None
+    password: Optional[str] = None
+    for line in output.splitlines():
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+        user_match = re.search(r"Username:\s*(\S+)", clean, re.I)
+        if user_match:
+            username = user_match.group(1)
+        pass_match = re.search(r"Password:\s*(\S+)", clean, re.I)
+        if pass_match:
+            password = pass_match.group(1)
+    return username, password
+
+
+def is_password_hash(value: str) -> bool:
+    return value.startswith(("$2a$", "$2b$", "$2y$"))
+
+
+def run_xui_install_script() -> Tuple[str, str]:
+    print("正在安装 3x-ui（SQLite / 随机端口 / 跳过 SSL）...")
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", f"curl -fsSL {shlex_quote(XUI_INSTALL_URL)} | bash"],
+            input=XUI_INSTALL_STDIN,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        exit_error("3x-ui 安装超时")
+
+    install_output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    if proc.returncode != 0:
+        exit_error(f"3x-ui 安装失败 (exit {proc.returncode}):\n{install_output.strip()[-2000:]}")
+
+    for _ in range(45):
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", "x-ui"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except OSError:
+            break
+        if result.stdout.strip() == "active":
+            print("3x-ui 安装完成，服务已启动")
+            username, password = parse_credentials_from_install_output(install_output)
+            if not username or not password:
+                exit_error("3x-ui 安装成功但未解析到登录凭据，请检查安装输出")
+            return username, password
+        time.sleep(2)
+    exit_error("3x-ui 安装完成但服务未启动，请检查 journalctl -u x-ui")
+
+
+def shlex_quote(value: str) -> str:
+    if re.match(r"^[A-Za-z0-9_/@.+-]+$", value):
+        return value
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def read_panel_user_from_db() -> Tuple[str, str]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT username, password FROM users ORDER BY id LIMIT 1")
+            row = cur.fetchone()
+    except sqlite3.Error as e:
+        exit_error(str(e))
+    if not row or not row[0]:
+        exit_error("未找到面板登录账号，请先安装 3x-ui")
+    return str(row[0]), str(row[1] or "")
+
+
+def collect_panel_access_info(
+    *,
+    installed_by_script: bool = False,
+    plain_username: Optional[str] = None,
+    plain_password: Optional[str] = None,
+) -> Dict[str, Any]:
+    binary = find_xui_binary()
+    db_username, db_password = read_panel_user_from_db()
+    username = plain_username or db_username
+    password = plain_password or db_password
+    if is_password_hash(password):
+        exit_error("无法读取面板明文密码，请重新执行模式 4 全新安装")
+    port_text = read_setting_from_db("webPort") or "2053"
+    base_path = read_setting_from_db("webBasePath") or "/"
+    listen_ip = (read_setting_from_db("listenIP") or "").strip()
+    cert = (read_setting_from_db("webCertFile") or "").strip()
+    key = (read_setting_from_db("webKeyFile") or "").strip()
+    https = bool(cert and key)
+    scheme = "https" if https else "http"
+    if not base_path.startswith("/"):
+        base_path = f"/{base_path}"
+    base_path = base_path.rstrip("/") or ""
+    path_suffix = base_path if base_path else ""
+    try:
+        port = int(port_text)
+    except ValueError:
+        port = 2053
+    local_host = "127.0.0.1"
+    if listen_ip in ("127.0.0.1", "::1", "localhost"):
+        local_host = "127.0.0.1"
+    local_url = f"{scheme}://{local_host}:{port}{path_suffix}"
+    public_url = ""
+    if listen_ip not in ("127.0.0.1", "::1", "localhost"):
+        try:
+            public_ip = get_public_ipv4()
+            public_url = f"{scheme}://{public_ip}:{port}{path_suffix}"
+        except SystemExit:
+            public_url = ""
+    api_token = read_api_token_from_cli(binary) or os.environ.get("XUI_API_TOKEN", "").strip()
+    info: Dict[str, Any] = {
+        "username": username,
+        "password": password,
+        "port": port,
+        "web_base_path": base_path or "/",
+        "listen_ip": listen_ip,
+        "access_url_local": local_url,
+        "access_url_public": public_url,
+        "api_token": api_token,
+        "installed_at": int(time.time()),
+    }
+    if installed_by_script:
+        info["installed_by_script"] = True
+    return info
+
+
+def save_panel_access_info(info: Dict[str, Any]) -> None:
+    try:
+        with open(PANEL_INFO_PATH, "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False, indent=2)
+        os.chmod(PANEL_INFO_PATH, 0o600)
+    except OSError as e:
+        exit_error(f"保存面板访问信息失败: {e}")
+
+    lines = [
+        "3x-ui 面板访问信息",
+        f"用户名: {info.get('username', '')}",
+        f"密码: {info.get('password', '')}",
+        f"本机地址: {info.get('access_url_local', '')}",
+    ]
+    public_url = str(info.get("access_url_public") or "").strip()
+    if public_url:
+        lines.append(f"公网地址: {public_url}")
+    api_token = str(info.get("api_token") or "").strip()
+    if api_token:
+        lines.append(f"API Token: {api_token}")
+    lines.append("")
+    try:
+        with open(PANEL_INFO_SNAPSHOT, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except OSError as e:
+        exit_error(f"保存面板快照失败: {e}")
+
+
+def load_panel_access_record() -> Optional[Dict[str, Any]]:
+    if not os.path.isfile(PANEL_INFO_PATH):
+        return None
+    try:
+        with open(PANEL_INFO_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def has_script_installed_panel() -> bool:
+    info = load_panel_access_record()
+    return bool(info and info.get("installed_by_script"))
+
+
+def load_panel_access_info() -> Optional[Dict[str, Any]]:
+    return load_panel_access_record()
+
+
+def print_panel_access_info() -> None:
+    if not has_script_installed_panel():
+        exit_error("当前面板非本脚本安装，无法查看面板访问信息")
+
+    if os.path.isfile(PANEL_INFO_SNAPSHOT):
+        try:
+            with open(PANEL_INFO_SNAPSHOT, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except OSError as e:
+            exit_error(f"读取面板访问信息失败: {e}")
+        if content:
+            print(content)
+            return
+
+    info = load_panel_access_info()
+    if not info:
+        exit_error("未找到面板访问信息，请先使用模式 4 全新安装")
+    exit_error("未找到面板访问快照，请重新执行模式 4 全新安装")
+
+
+def ensure_xui_for_fresh_setup() -> None:
+    if is_xui_installed():
+        exit_error("检测到已安装 3x-ui，请使用模式 1 安装节点")
+    username, password = run_xui_install_script()
+    info = collect_panel_access_info(
+        installed_by_script=True,
+        plain_username=username,
+        plain_password=password,
+    )
+    save_panel_access_info(info)
+    print(f"面板信息已保存到 {PANEL_INFO_SNAPSHOT}")
+    print(f"本机地址: {info['access_url_local']}")
+    print(f"用户名: {info['username']}")
+    print(f"密码: {info['password']}")
+
+
+def ensure_cfd_command() -> bool:
+    if os.geteuid() != 0:
+        return False
+    script_path = os.path.realpath(__file__)
+    install_dir = os.path.dirname(DEPLOYER_INSTALL_PATH)
+    try:
+        os.makedirs(install_dir, exist_ok=True)
+        need_copy = True
+        if os.path.isfile(DEPLOYER_INSTALL_PATH):
+            try:
+                need_copy = os.path.getsize(script_path) != os.path.getsize(DEPLOYER_INSTALL_PATH)
+            except OSError:
+                need_copy = True
+        if need_copy:
+            shutil.copy2(script_path, DEPLOYER_INSTALL_PATH)
+        os.chmod(DEPLOYER_INSTALL_PATH, 0o755)
+
+        first_install = not os.path.isfile(CFD_BIN)
+        cfd_script = (
+            "#!/bin/bash\n"
+            f"exec python3 {DEPLOYER_INSTALL_PATH} \"$@\"\n"
+        )
+        with open(CFD_BIN, "w", encoding="utf-8") as f:
+            f.write(cfd_script)
+        os.chmod(CFD_BIN, 0o755)
+        if first_install:
+            print(f"已注册快捷命令 cfd，后续输入 cfd 即可打开本脚本")
+        return True
+    except OSError:
+        return False
+
+
+def print_xui_management_help() -> None:
+    if not is_xui_installed():
+        exit_error("未安装 3x-ui，暂无管理命令")
+
+    lines = [
+        "3x-ui 管理命令",
+        "",
+        "后续管理面板，在终端输入：",
+        "  x-ui",
+        "",
+        "常用命令（可直接执行，无需进入菜单）：",
+        "  x-ui start              启动面板",
+        "  x-ui stop               停止面板",
+        "  x-ui restart            重启面板",
+        "  x-ui restart-xray       重启 Xray",
+        "  x-ui status             查看运行状态",
+        "  x-ui settings           查看当前面板设置",
+        "  x-ui enable             启用开机自启",
+        "  x-ui disable            禁用开机自启",
+        "  x-ui log                查看日志",
+        "  x-ui update             更新 3x-ui",
+        "",
+        "CF 部署器快捷命令：",
+        "  cfd                     再次打开本脚本",
+        "",
+        "进入 x-ui 交互菜单后，还可修改端口、重置密码、SSL 证书等。",
+        "",
+        "提示: 输入 x-ui 可随时进入 3x-ui 管理菜单",
+    ]
+    if shutil.which("cfd"):
+        lines.append("提示: 输入 cfd 可随时调用本部署脚本")
+    print("\n".join(lines))
+
+
+def build_mode_prompt() -> str:
+    options = ["1=安装", "2=卸载", "3=查看订阅"]
+    if not is_xui_installed():
+        options.append("4=全新安装(含x-ui)")
+    if has_script_installed_panel():
+        options.append("5=查看面板")
+    if is_xui_installed():
+        options.append("6=面板管理命令")
+    default = "全新安装" if not is_xui_installed() else "安装"
+    return f"模式({','.join(options)},回车={default}): "
 
 
 def panel_tls_insecure(panel_url: str, panel_https: bool) -> bool:
@@ -1316,13 +1619,21 @@ def parse_protocol_selection(raw: str) -> List[str]:
 
 def parse_mode(raw: str) -> str:
     text = raw.strip().lower()
-    if text in ("", "1", "install", "i", "安装"):
+    if text == "":
+        return "fresh" if not is_xui_installed() else "install"
+    if text in ("1", "install", "i", "安装"):
         return "install"
     if text in ("2", "uninstall", "u", "卸载"):
         return "uninstall"
-    if text in ("3", "show", "view", "v", "查看"):
+    if text in ("3", "show", "view", "v", "查看", "查看订阅"):
         return "show"
-    exit_error("无效模式，仅支持 1(安装) / 2(卸载) / 3(查看上次订阅)")
+    if text in ("4", "fresh", "setup", "全新", "全新安装", "安装x-ui"):
+        return "fresh"
+    if text in ("5", "panel", "面板", "查看面板"):
+        return "panel"
+    if text in ("6", "xui", "manage", "管理", "管理命令", "面板管理"):
+        return "xui_manage"
+    exit_error("无效模式")
 
 
 def get_inbounds_schema(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -1947,38 +2258,8 @@ def uninstall_last_config(
     delete_managed_inbounds(backend, inbound_ids, tags, panel=panel)
 
 
-def main() -> None:
-    mode = parse_mode(input("模式(1=安装,2=卸载,3=查看上次订阅，回车=安装): "))
-    prompt_maybe_localize_xui_menu()
+def run_deploy_install() -> None:
     last_state = load_last_state()
-
-    if mode == "show":
-        maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
-        print_last_links()
-        return
-
-    if mode == "uninstall":
-        if last_state is None:
-            exit_error("未检测到上次配置，无法卸载")
-        backend, runtime, reason = resolve_backend(last_state)
-        print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
-        panel: Optional[XuiPanelClient] = None
-        if backend == BACKEND_API:
-            panel = setup_panel_client(runtime, interactive=False)
-        cf_email = input("Cloudflare 邮箱: ").strip()
-        cf_key = getpass("Cloudflare Global API Key: ").strip()
-        if not cf_email or not cf_key:
-            exit_error("邮箱和 API Key 不能为空")
-        headers = {
-            "X-Auth-Email": cf_email,
-            "X-Auth-Key": cf_key,
-            "Content-Type": "application/json",
-        }
-        uninstall_last_config(last_state, headers, backend, panel=panel)
-        remove_last_state()
-        print("卸载成功")
-        return
-
     backend, runtime, reason = resolve_backend()
     print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
     panel = None
@@ -1986,7 +2267,7 @@ def main() -> None:
         if not os.path.exists(DB_PATH):
             exit_error(f"未找到 3x-ui 数据库: {DB_PATH}")
         normalize_existing_inbound_client_email(DB_PATH)
-        maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
+        maybe_repair_v3_client_bindings(DB_PATH, "install", last_state)
     else:
         panel = setup_panel_client(runtime, interactive=False)
 
@@ -2087,6 +2368,63 @@ def main() -> None:
     print(f"已保存订阅到 {LAST_LINKS_PATH}")
     for protocol in selected_protocols:
         print(f"{PROTOCOL_LABEL[protocol]}订阅 {links[protocol]}")
+
+
+def main() -> None:
+    ensure_cfd_command()
+    mode = parse_mode(input(build_mode_prompt()))
+    prompt_maybe_localize_xui_menu()
+    last_state = load_last_state()
+
+    if mode == "fresh":
+        if is_xui_installed():
+            exit_error("检测到已安装 3x-ui，请使用模式 1 安装节点")
+        ensure_xui_for_fresh_setup()
+        run_deploy_install()
+        return
+
+    if mode == "panel":
+        if not has_script_installed_panel():
+            exit_error("当前面板非本脚本安装，无法查看面板访问信息")
+        print_panel_access_info()
+        return
+
+    if mode == "xui_manage":
+        print_xui_management_help()
+        return
+
+    if mode == "show":
+        maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
+        print_last_links()
+        return
+
+    if mode == "uninstall":
+        if last_state is None:
+            exit_error("未检测到上次配置，无法卸载")
+        backend, runtime, reason = resolve_backend(last_state)
+        print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
+        panel: Optional[XuiPanelClient] = None
+        if backend == BACKEND_API:
+            panel = setup_panel_client(runtime, interactive=False)
+        cf_email = input("Cloudflare 邮箱: ").strip()
+        cf_key = getpass("Cloudflare Global API Key: ").strip()
+        if not cf_email or not cf_key:
+            exit_error("邮箱和 API Key 不能为空")
+        headers = {
+            "X-Auth-Email": cf_email,
+            "X-Auth-Key": cf_key,
+            "Content-Type": "application/json",
+        }
+        uninstall_last_config(last_state, headers, backend, panel=panel)
+        remove_last_state()
+        print("卸载成功")
+        return
+
+    if not is_xui_installed():
+        exit_error("未检测到 3x-ui，请使用模式 4(全新安装)")
+
+    run_deploy_install()
+    return
 
 
 if __name__ == "__main__":

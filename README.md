@@ -1,20 +1,22 @@
 # 3x-ui Cloudflare 部署器
 
-`xui_cf_deployer.py` 是一个基于 Python 3 标准库实现的本地脚本，用于在已安装 3x-ui 的 VPS 上自动完成：
+`xui_cf_deployer.py` 是一个基于 Python 3 标准库实现的本地脚本，用于在 VPS 上自动完成：
 
+- **可选**：在裸机上自动安装 3x-ui 面板
 - 按需创建 VLESS / Trojan / VMess 节点
 - 通过 **3x-ui REST API** 或 **SQLite 直写**（旧版默认）创建/删除入站
 - 配置 Cloudflare DNS、SSL、Origin Rules
 - 生成 `yx-auto.pages.dev` 订阅链接
 - 检测上次配置并支持一键卸载回滚
 
-## 前置条件（必须）
+## 前置条件
 
-- 目标 VPS **必须已安装并可正常运行 3x-ui 面板**
+- **模式 1（安装）**：目标 VPS **必须已安装并可正常运行 3x-ui 面板**
+- **模式 4（全新安装）**：**仅**在未安装 3x-ui 的裸机上可用，脚本会自动安装面板后再部署节点
 - **旧版默认**：本地存在 `/etc/x-ui/x-ui.db`，脚本直写数据库并 `systemctl restart x-ui`
 - **新版可选**：面板 API 可访问，使用用户名密码或 API Token
 
-> 未满足以上条件时，请先完成 3x-ui 安装与可用性验证，再运行本脚本。
+> 若尚未安装 3x-ui，请使用 **模式 4**；若已安装，使用 **模式 1** 即可。
 
 ## 运行环境
 
@@ -29,6 +31,8 @@
 - 脚本：`xui_cf_deployer.py`
 - 状态记录：`/etc/x-ui/cf_auto_state.json`
 - 订阅快照：`cf_auto_last_links.txt`（保存在脚本运行目录）
+- 面板访问信息：`/etc/x-ui/cf_panel_access.json`（JSON，权限 600）
+- 面板访问快照：`cf_panel_last_access.txt`（保存在脚本运行目录，便于二次查看）
 
 ## x-ui 写入方式（自动检测）
 
@@ -68,13 +72,30 @@ sudo ./xui_cf_deployer.py
 
 ## 交互流程
 
-脚本启动后会先选择模式：
+脚本启动后会先选择模式（菜单会根据当前环境动态显示）：
 
-- `1`：安装（默认）
+- `1`：安装节点（需已安装 3x-ui）
 - `2`：卸载
 - `3`：查看上次订阅
+- `4`：全新安装（**仅未安装 x-ui 时显示**；自动安装 3x-ui + 部署节点，并保存面板 URL/密码）
+- `5`：查看面板访问信息（**仅本脚本安装过 x-ui 时显示**）
+- `6`：查看 x-ui 管理命令（**已安装 x-ui 时显示**；提示后续可输入 `x-ui` 管理面板）
 
-### 安装模式
+裸机上直接回车默认进入模式 4；已安装 x-ui 时回车默认进入模式 1。
+
+脚本首次以 root 运行时会自动注册快捷命令 **`cfd`**，后续输入 `cfd` 即可再次打开本部署器（安装路径：`/usr/local/lib/cf-deployer/xui_cf_deployer.py`）。
+
+### 全新安装模式（模式 4）
+
+**仅适用于未安装 3x-ui 的新 VPS**。若检测到已有 x-ui，会提示改用模式 1。
+
+流程如下：
+
+1. 自动执行官方 `install.sh`（SQLite / 随机端口 / 跳过 SSL）
+2. 采集并保存面板登录信息（标记 `installed_by_script`）到 `cf_panel_last_access.txt` 与 `/etc/x-ui/cf_panel_access.json`
+3. 继续执行与模式 1 相同的域名 + Cloudflare + 节点部署流程
+
+### 安装模式（模式 1）
 
 按提示输入：
 
@@ -100,7 +121,7 @@ sudo ./xui_cf_deployer.py
 - 恢复/删除该子域名 DNS 记录
 - 删除本地状态文件
 
-### 查看模式
+### 查看订阅模式（模式 3）
 
 无需重装即可回看上次订阅：
 
@@ -108,6 +129,20 @@ sudo ./xui_cf_deployer.py
 - 若快照不存在，自动尝试旧版兼容重建：
   - 先用旧状态文件中的 `domain/uuid/routes` 重新拼接
   - 再兜底通过 3x-ui API 列出现有入站并反推一套节点
+
+### 查看面板模式（模式 5）
+
+**仅在本脚本通过模式 4 安装过 3x-ui 时可用**。手动安装的面板不会显示此选项，也无法查看。
+
+- 优先读取运行目录下的 `cf_panel_last_access.txt`
+- 记录保存在 `/etc/x-ui/cf_panel_access.json`（含 `installed_by_script: true` 标记）
+
+### 面板管理命令（模式 6）
+
+**已安装 3x-ui 时可用**，列出常用 `x-ui` 子命令，并提示：
+
+- 输入 **`x-ui`** 进入 3x-ui 交互管理菜单
+- 输入 **`cfd`** 再次打开本 CF 部署脚本
 
 ## 订阅链接参数
 
